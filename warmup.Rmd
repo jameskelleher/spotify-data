@@ -1,0 +1,71 @@
+---
+title: "Spotify Assessment: Warmup"
+author: "James Kelleher"
+output: html_document
+---
+
+```{r, echo=FALSE}
+options(scipen = 999)
+
+if (!file.exists("data_sample/user_data_sample.csv") || !file.exists("data_sample/end_song_sample.csv")) {
+    dataUrl <- "https://storage.googleapis.com/ml_take_home/data_sample.tgz"
+    dir.create("data_sample")
+    setwd("data_sample/")
+    tmp <- tempfile()
+    download.file(dataUrl, tmp)
+    untar(tmp)
+    unlink(tmp)
+    setwd("..")
+}
+```
+
+The purpose of this analysis is to explore whether or not there is a signifant difference between male and female listeners with regards to total listening time. The required data is provided in the `data_sample` folder. We will load the the data into data tables using the `fread` function due to the rapid performance of `fread` and data tables.
+
+```{r}
+library(data.table)
+library(ggplot2)
+
+user.data <- fread("data_sample/user_data_sample.csv", na.strings = c("unknown", ""))
+end.song.data <- fread("data_sample/end_song_sample.csv", na.strings = c("unknown", ""))
+```
+
+Once we have the data loaded, we want to group the end song data by user ID in order to find the sum of the time spent playing. 
+
+```{r}
+total.time.spent.listening <- end.song.data[, list(time_played_ms = sum(ms_played)), by = user_id]
+```
+
+We can merge the info on each user's gender into the table on each user's total time spent listening on the user ID.
+
+```{r}
+total.time.spent.listening <- merge(x = total.time.spent.listening, y = user.data[, list(gender, user_id)],
+                                    by = "user_id", all.x = TRUE)  # acts as left join
+
+# clear any rows with missing values
+total.time.spent.listening <- total.time.spent.listening[complete.cases(total.time.spent.listening), ]
+```
+
+One quick and simple way to determine whether male and female listeners are significantly different in their overall listening is to compare histograms.
+
+```{r}
+# we convert time_played_ms to seconds in order to make it easier to understand the plot
+qplot(time_played_ms / 1000, data = total.time.spent.listening, geom = "histogram", facets = (gender ~ .),
+      bins = 30, xlab = "time played (seconds)")
+```
+
+```{r}
+cutoff_ms <- 100000000
+cutoff_sec <- cutoff_ms / 1000
+```
+
+It's clear from the plot that the vast majority of listeners have committed less than `r cutoff_sec` seconds. In fact, only `r percentage = 100 * with(total.time.spent.listening, sum(time_played_ms > cutoff_ms) / length(time_played_ms)); round(percentage, 2)`% of listeners have logged more time. We can obtain a more descriptive image of the data by focusing on the values within that cutoff.
+
+```{r}
+in_cutoff <- total.time.spent.listening$time_played_ms < cutoff_ms
+qplot(time_played_ms / 1000, data = total.time.spent.listening[in_cutoff], geom = "histogram",
+      facets = (gender ~ .), bins = 30, xlab = "time played (seconds)")
+```
+
+Judging from the plot, it appears that the total listening time between male and female listeners does not vary significantly. The only noticible difference is that male listeners seem to be slightly more likely to have listened for only an hour or two[^1]. Still, this difference is minor. Out of those listeners who have spent about an hour of total listening time, about `r round(2000 / (2000 + 1750), 2)`% are male; in plain language, this method of categorization is hardly better than a coin flip. Every other case appears to have both a smaller sample size and a smaller difference. It therefore does not seem practical to use total listening time as a means of distinguishing between male and female listeners.
+
+[^1]: Note that with 30 bins and a maximum value of 100,000 seconds, Each bin incorportates a range of 3333.33 seconds. This is equal to about 0.93 hours.

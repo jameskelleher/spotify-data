@@ -1,0 +1,241 @@
+---
+title: "Spotify Assessment: Main Analysis"
+author: "James Kelleher"
+date: "January 23, 2016"
+output: html_document
+---
+
+### Abstract
+The purpose of this paper is to explore signifcant differences between different user demographics with regard to the average length of listening sessions. First, we perform some prelimary work on the initial dataset in order to identify every session. From there, we perform some basic ANOVA on the frequency distributions of each user's average session length in order to potentially identify significant differences between different user demographics. Upon comparing histograms of average session length between demographics, it becomes clear that the distribution of average session length per user is consitant across categories.
+
+### Introduction 
+
+For the purposes of this assignment a session is defined as period of continuous listening with only small breaks in time between track listens. It is reasonable to assume that a Spotify user may interrupt their listening for a reason that does not reflect their intention to use the product, i.e. to take a bathroom break. It is also likely that, even for compleletly continuous sessions, there might be a gap of a few milliseconds due to errors in the data reording procedure. Therefore, even outside of considerations of human behavior, some acceptible gap of time between listens will be needed. In this paper, a reasonably sized gap will be defined to be three minutes, just enough time for a short break.
+
+Based on this definition, sessions can include the same song multiple times, even consecutively. It can also be cross-platform (for example, from desktop to mobile). These features are included to preserve the nature of a session being some period of continuous listening.
+
+A session must also be longer than 30 seconds. Any shorter than that is not a reasonable amount of time to be considered intentional on the user's part. For example, a user accidentally pressing "play" or listening to ten seconds of a song before deciding they don't like it and moving on to a different activity should not be considered a session.
+
+Once we've computed the average session length per user, we can compare this variable between different demographics. We will specifically be examing the frequency distribution of average session lengths. If these distributions are noticibly different between demographics - that is to say, if they have distant means with small, non-overlapping widths (standard deviations) - we will know that average session length per user can act as a useful categorical indicator.
+
+### Procedure
+
+#### Loading the data
+
+First, we load the data into data tables due to their improved operational performance over data frames.
+
+```{r, echo=FALSE}
+if (!file.exists("data_sample/user_data_sample.csv") || !file.exists("data_sample/end_song_sample.csv")) {
+    dataUrl <- "https://storage.googleapis.com/ml_take_home/data_sample.tgz"
+    dir.create("data_sample")
+    setwd("data_sample/")
+    tmp <- tempfile()
+    download.file(dataUrl, tmp)
+    untar(tmp)
+    unlink(tmp)
+    setwd("..")
+}
+```
+
+```{r}
+library(data.table)
+library(zoo, warn.conflicts = FALSE)
+library(ggplot2)
+
+user.data <- fread("data_sample/user_data_sample.csv", na.strings = c("unknown", ""))
+end.song.data <- fread("data_sample/end_song_sample.csv", na.strings = c("unknown", ""))
+```
+
+#### Identifying sessions
+
+One efficient way to identify sessions is to locate the the first song in each session. Assuming that the data has been ordered by user and end timestamp, we know that all songs that are not session starts are members of the same session as the nearest preceeding session start. That is to say, given we have identified a session start song, we can identify its fellow session members by imputing its identifier forward in the data until we reach the next session start song.
+
+We first order the end song data by `user_id`, then `end_timestamp`.
+
+```{r}
+end.song.data <- end.song.data[order(user_id, end_timestamp)]
+head(end.song.data[, list(user_id, end_timestamp, ms_played)])
+tail(end.song.data[, list(user_id, end_timestamp, ms_played)])
+```
+
+All session start songs must meet one of two criteria:
+
+1. It is the first song a user has listened to
+2. The break between the end of the previous song and the start of the song in question must be longer than an accepted time range
+
+For the first criterion, we identify all rows within the ordered data set that include the first mention of a `user_id`. To do this quickly, we take the `user_id` factor, rotate it by one, and compare it to original factor. Every non-match will indicate a row that contains the first song a user has listened to within the data set[^1].
+
+```{r}
+num.listens <- nrow(end.song.data)
+
+end.song.data$user_id = as.factor(end.song.data$user_id)
+
+user.labels <- as.integer(end.song.data$user_id)
+# rotate the vector forward
+user.labels.offset <- with(end.song.data, append(user_id[num.listens], user_id[-num.listens]))
+first.user.mention.in.table <- user.labels != user.labels.offset
+```
+
+For the second criterion, we identify all rows where the time difference between a song's beginning and its predecessor's end is greater than an accepted range. As mentioned above, a reasonable range is assumed to be three minutes.
+
+```{r}
+prev.end <- end.song.data$end_timestamp
+# rotate the vector forward
+prev.end <- c(prev.end[num.listens], prev.end[-num.listens]) 
+
+time.range.ms <- 3 * 60  # mintues * seconds
+prev.song.not.in.session.range <- with(end.song.data, end_timestamp - ms_played/1000 - prev.end > time.range.ms)
+```
+
+To obtain a vector that indicates all session start songs, we simply apply an element-wise `OR` between the two logcial vectors we've produced.
+
+```{r}
+is.session.start <- first.user.mention.in.table | prev.song.not.in.session.range
+```
+
+We then create a vector of entirely `NA` elements whose length is equal the number of rows in the data frame. With our logical `is.session.start` vector, we can provide a unique id for every session start song in the corresponding position. As argued above, we need only impute these values forward in order to identify the session that every song belongs to.
+
+```{r}
+num.sessions <- sum(is.session.start)
+
+session.id <- rep.int(NA, num.listens)
+
+session.id[is.session.start] <- 1:num.sessions
+session.id <- na.locf(session.id)
+```
+
+We then add our `session.id` vector to the `end.song.data` data table.
+
+```{r}
+end.song.data$session_id <- session.id
+head(end.song.data[, list(user_id, end_timestamp, ms_played, session_id)])
+tail(end.song.data[, list(user_id, end_timestamp, ms_played, session_id)])
+```
+
+Now that every session has a unique ID and every song belongs to a session, we can identify which sessions are less than 30 seconds long. To remove these rows, we must first group our data by session ID and calculate the length of the session. This value is difference between the start of the first song and the end of the last.
+
+```{r}
+session.data <- end.song.data[,
+                              list(
+                                  user_id = user_id[1],
+                                  num_songs_in_session = length(end_timestamp),
+                                  session_length_sec = end_timestamp[length(end_timestamp)] -
+                                                       end_timestamp[1] + ms_played[1] / 1000
+                                ),
+                              by = session_id]
+
+head(session.data[, list(session_id, num_songs_in_session, session_length_sec)])
+
+# percent of sessions less than 30 sec long:
+100 * nrow(session.data[session_length_sec < 30]) / nrow(session.data)
+```
+
+These short sessions actually take up a significant portion of the data at this stage - about `r round(100 * nrow(session.data[session_length_sec < 30]) / nrow(session.data), 2)`%. We scrub these rows from the dataset.
+
+```{r}
+session.data <- session.data[session_length_sec > 30]
+```
+
+To obtain the average session length per user, we can group on the user ID. We will consider length both in terms of songs listened to and time spent listening.
+
+```{r}
+avg.session.data <- session.data[,
+                                 list(avg_len_songs = sum(num_songs_in_session) / length(num_songs_in_session),
+                                      avg_len_sec = sum(session_length_sec) / length(session_length_sec)
+                                 ),
+                                 by = user_id]
+```
+
+#### Comparing Demographics
+
+Now that we've obtained the average session lengths, we can explore relationships between demographic features and average session lengths. We first merge in the user data.
+
+```{r}
+avg.session.data <- merge(x = avg.session.data, y = user.data, by = "user_id", all.x = TRUE)  # this acts as a left join
+
+# remove rows with missing values
+avg.session.data <- avg.session.data[complete.cases(avg.session.data), ]
+```
+
+We can get a high-level view of the data by using a histogram.
+
+```{r}
+qplot(avg_len_songs, data = avg.session.data, geom = "histogram", bins = 30,
+      main = "Avg Songs Listened To, Overall")
+
+# percent of sessions less than 50 songs long
+100 * nrow(avg.session.data[avg_len_songs < 50]) / nrow(avg.session.data)
+```
+
+The vast majority of average sessions (about `r round(100 * nrow(avg.session.data[avg_len_songs < 50]) / nrow(avg.session.data), 2)`%) are less than fifty songs long. We can get a more descriptive view of our data by using 50 as a cutoff. 
+
+```{r}
+specifier <- with(avg.session.data, avg_len_songs < 50)
+qplot(avg_len_songs, data = avg.session.data[specifier], geom = "histogram", bins = 30,
+      main = "Avg Songs Listened To, Overall")
+```
+
+We can quickly compare male listeners to female listeners by using a histogram. First, the number of songs in a session:
+
+```{r}
+qplot(avg_len_songs, data = avg.session.data[specifier], geom = "histogram", bins = 30, facets = gender ~ .,
+      main = "Avg Songs Listened To by Gender")
+```
+
+Next, the time spent listening:
+
+```{r}
+qplot(avg_len_sec, data = avg.session.data[specifier], geom = "histogram", bins = 30, facets = gender ~ .,
+      main = "Avg Time spent Listening by Gender (seconds)")
+```
+
+Though female listeners appear slightly more likely to listen for longer (both in terms of songs and seconds), there is not enough difference in mean and variance to categorize gender based on session length.
+
+Looking next at age range:
+```{r}
+qplot(avg_len_songs, data = avg.session.data[specifier], geom = "histogram", bins = 30, facets = age_range ~ .,
+      main = "Avg Songs Listened To by Age Range")
+qplot(avg_len_sec, data = avg.session.data[specifier], geom = "histogram", bins = 30, facets = age_range ~ .,
+      main = "Avg Time spent Listening by Age Range (seconds)")
+```
+
+Again, the behavior appears consistant between categories. Let's look at the five most populous countries. First, we figure out which ones they are.
+
+```{r}
+country.counts = avg.session.data[, list(count = length(user_id)), by = country]
+head(country.counts[order(-count)])
+```
+
+They are the USA, Great Britain, Germany, Mexico, and Spain. Selecting those countries yields the following plots:
+
+```{r}
+countries <- c("US", "GB", "DE", "MX", "ES")
+qplot(avg_len_songs, data = avg.session.data[specifier & country %in% countries], geom = "histogram", bins = 30,
+      facets = country ~ ., main = "Avg Songs Listened To by Country")
+qplot(avg_len_sec, data = avg.session.data[specifier & country %in% countries], geom = "histogram", bins = 30,
+      facets = country ~ ., main = "Avg Time spent Listening by Country (seconds)")
+```
+
+Again, very similar distributions.
+
+Finally, we can look at account age. In the dataset this account ranges from `r min(avg.session.data$acct_age_weeks)` to `r max(avg.session.data$acct_age_weeks)` weeks. We can cut this into four equally spaced groups.
+
+```{r}
+avg.session.data$acct_age_range <- cut(avg.session.data$acct_age_weeks, 4)
+qplot(avg_len_songs, data = avg.session.data[specifier], geom = "histogram", bins = 30,
+      facets = acct_age_range ~ ., main = "Avg Songs Listened To by Account Age Range")
+qplot(avg_len_sec, data = avg.session.data[specifier], geom = "histogram", bins = 30,
+      facets = acct_age_range ~ ., main = "Avg Time spent Listening by Account Age Range (seconds)")
+```
+
+The average session length appears to be consinstantly distributed across all categories here as well.
+
+### Conclusion
+
+We observed similar distributions of average session length per user - both in terms of time spent listening and number of songs listened to - across all given user demographics. Therefore average session length does not appear to be a good categorical predictor.
+
+It could be worth exploring the `product` and `context` categories. For example, it could be that average user sessions are longer on the premium product versus the free product, as premium users are a) not interrupted by ads and b) more invested in the product, at least from a financial point of view. Or, maybe sessions are longer when the context is album-only versus artist only, as the user would be inclined to listen to the whole album versus just the top few artist tracks. It could also be interesting the determine how changing one's product (for example, going from a free to premium account, or vice versa) affects a user's listening behavior.
+
+It also might be worth exploring different types of sessions. For example, assume a "music exploration" session to be one where a user is sampling multiple songs in quick succesion in order to find something new that they like. It is reasonable to hypothesize that younger users hungry for new music to enjoy and share with friends would be more likely to partake in these types of sessions as opposed to older users who may be more set in their tastes. We could define a music exploration session given the present data as a session with entirely unique song IDs and a high ratio of songs played compared to session length, perhaps even with lower-than-average `ms_played` values (to indicate that a user is not listening to the full song but rather just sampling a portion of it). Alternatively, we can identify "repeat listen" session as those where the listener played some song multiple times. These sessions would be those with only a single unique song ID and multiple listens. Specifying sessions on these grounds could yield noticible differences between demographic behavior.
+
+[^1]: This procedure assumes that the data provided does not cut off any sessions mid-listen.
